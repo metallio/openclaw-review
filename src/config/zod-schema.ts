@@ -11,6 +11,7 @@ import {
   SessionSchema,
   SessionSendPolicySchema,
 } from "./zod-schema.session.js";
+import { AutonomousAgentConfigSchema } from "../autonomous-agent/config-schema.js";
 
 const BrowserSnapshotDefaultsSchema = z
   .object({
@@ -550,6 +551,7 @@ export const OpenClawSchema = z
       })
       .strict()
       .optional(),
+    autonomousAgent: AutonomousAgentConfigSchema,
     plugins: z
       .object({
         enabled: z.boolean().optional(),
