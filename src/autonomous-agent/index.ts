@@ -5,39 +5,61 @@
  * business unit — a "digital colleague" with its own identity, credentials,
  * and 24/7 autonomous operation.
  *
+ * Getting started — just provide Google credentials:
+ * ```json
+ * {
+ *   "autonomousAgent": {
+ *     "enabled": true,
+ *     "google": { "email": "bot@company.com", "password": "..." }
+ *   }
+ * }
+ * ```
+ *
+ * The agent will autonomously:
+ *   1. Log into Google via browser (Computer Use)
+ *   2. Generate an App Password for IMAP/SMTP
+ *   3. Start monitoring Gmail for service invites
+ *   4. Accept invites, register in services, obtain API tokens
+ *   5. Transition from browser to direct API calls
+ *   6. Process tasks from webhooks and cron schedules 24/7
+ *
  * Architecture:
  *
- *   ┌──────────────────────────────────────────────────────────────┐
- *   │                   AutonomousAgentOrchestrator                │
- *   │                                                              │
- *   │  ┌─────────────┐  ┌───────────────┐  ┌──────────────────┐  │
- *   │  │ SecureVault  │  │ AgentIdentity │  │  TaskQueue       │  │
- *   │  │ (AES-256)    │  │ (Persistent)  │  │  (Priority)      │  │
- *   │  └──────┬───────┘  └───────┬───────┘  └────────┬─────────┘  │
- *   │         │                  │                    │            │
- *   │  ┌──────┴───────┐  ┌──────┴────────┐  ┌───────┴──────────┐ │
- *   │  │ Onboarding   │  │ API Bootstrap │  │ Scheduler        │ │
- *   │  │ ┌──────────┐ │  │ Browser→API   │  │ ┌──────────────┐ │ │
- *   │  │ │ Email    │ │  │ transition    │  │ │ Webhooks     │ │ │
- *   │  │ │ Monitor  │ │  │               │  │ │ Receiver     │ │ │
- *   │  │ └──────────┘ │  │ ┌───────────┐ │  │ └──────────────┘ │ │
- *   │  │ ┌──────────┐ │  │ │ Service   │ │  │ ┌──────────────┐ │ │
- *   │  │ │ Invite   │ │  │ │ API       │ │  │ │ Recurring    │ │ │
- *   │  │ │ Detector │ │  │ │ Client    │ │  │ │ Runner       │ │ │
- *   │  │ └──────────┘ │  │ └───────────┘ │  │ └──────────────┘ │ │
- *   │  └──────────────┘  └───────────────┘  └──────────────────┘  │
- *   └──────────────────────────────────────────────────────────────┘
+ *   ┌────────────────────────────────────────────────────────────────┐
+ *   │                  AutonomousAgentOrchestrator                   │
+ *   │                                                                │
+ *   │  ┌────────────────┐                                           │
+ *   │  │ GoogleBootstrap │  ← Login + App Password + Services       │
+ *   │  └───────┬────────┘                                           │
+ *   │          │ (auto-configures everything below)                  │
+ *   │          ▼                                                     │
+ *   │  ┌─────────────┐  ┌───────────────┐  ┌──────────────────┐    │
+ *   │  │ SecureVault  │  │ AgentIdentity │  │  TaskQueue       │    │
+ *   │  │ (AES-256)    │  │ (from Google) │  │  (Priority)      │    │
+ *   │  └──────┬───────┘  └───────┬───────┘  └────────┬─────────┘    │
+ *   │         │                  │                    │              │
+ *   │  ┌──────┴───────┐  ┌──────┴────────┐  ┌───────┴──────────┐   │
+ *   │  │ Onboarding   │  │ API Bootstrap │  │ Scheduler        │   │
+ *   │  │  Gmail IMAP  │  │ Browser→API   │  │  Webhooks+Cron   │   │
+ *   │  │  auto-config │  │ transition    │  │  reactive engine │   │
+ *   │  └──────────────┘  └───────────────┘  └──────────────────┘   │
+ *   └────────────────────────────────────────────────────────────────┘
  *
  * Key principles:
- *   - Self-provisioning: Agent can register itself in services via email invites
- *   - Browser → API: Starts with browser automation, graduates to direct API calls
- *   - Event-driven: Reacts to webhooks and processes tasks from a priority queue
- *   - Self-hosted: All credentials encrypted locally, no external data storage
+ *   - Google-first: Just email + password, everything else is auto-derived
+ *   - Self-provisioning: Agent registers itself in services via email invites
+ *   - Browser → API: Starts with browser automation, graduates to direct API
+ *   - Event-driven: Reacts to webhooks and processes tasks from priority queue
+ *   - Self-hosted: All credentials encrypted locally with AES-256-GCM
  *   - Long-running: Persistent state across restarts, daemon-mode operation
  */
 
 export { AutonomousAgentOrchestrator } from "./orchestrator.js";
 export type { AutonomousAgentConfig } from "./orchestrator.js";
+
+// Google bootstrap
+export { GoogleBootstrap } from "./google-bootstrap/index.js";
+export type { GoogleCredentials, GoogleBootstrapPhase, GoogleBootstrapState, GoogleBootstrapEvent } from "./google-bootstrap/index.js";
 
 // Subsystem exports
 export { SecureVault } from "./vault/index.js";

@@ -8,7 +8,16 @@ import { AutonomousAgentOrchestrator } from "./orchestrator.js";
  * Integrates the Autonomous Agent subsystem into the OpenClaw gateway.
  *
  * Called during gateway startup when `autonomousAgent.enabled` is true.
- * Returns the orchestrator instance and an HTTP handler for webhook endpoints.
+ *
+ * Minimal usage — the user only provides Google credentials:
+ * ```json
+ * { "autonomousAgent": { "enabled": true, "google": { "email": "...", "password": "..." } } }
+ * ```
+ *
+ * Everything else is auto-configured:
+ *   - Identity derived from Google profile
+ *   - Gmail IMAP auto-configured via App Password
+ *   - Services auto-discovered from Google Workspace
  */
 export async function startAutonomousAgent(params: {
   config: NonNullable<ConfigSchemaType>;
@@ -39,33 +48,28 @@ export async function startAutonomousAgent(params: {
 
   const agentDataDir = path.join(dataDir, "autonomous-agent");
 
+  log("info", "Starting Autonomous Agent with Google bootstrap", {
+    email: config.google.email,
+  });
+
   const orchestrator = new AutonomousAgentOrchestrator({
     dataDir: agentDataDir,
     masterPassword,
-    identity: {
-      instanceId: `agent-${Date.now()}`,
-      displayName: config.identity.displayName,
-      email: config.identity.email,
-      role: config.identity.role ?? "AI Team Member",
-      avatarUrl: config.identity.avatarUrl,
-      timezone: config.identity.timezone ?? "UTC",
-      locale: config.identity.locale ?? "en",
-      workingHours: config.identity.workingHours ?? { start: "00:00", end: "23:59" },
-      registeredServices: [],
-      createdAt: new Date().toISOString(),
+    google: {
+      email: config.google.email,
+      password: config.google.password,
     },
-    email: config.email ? {
-      enabled: config.email.enabled,
-      imap: config.email.imap,
-      credentialLabel: config.email.credentialLabel ?? "agent-email",
-      pollIntervalMs: config.email.pollIntervalMs ?? 300_000,
-      agentEmail: config.email.agentEmail,
-      invitePatterns: config.email.invitePatterns ?? [
-        "invited you to",
-        "join.*workspace",
-        "accept.*invitation",
-        "you've been added",
-      ],
+    identityOverrides: config.identity ? {
+      displayName: config.identity.displayName,
+      role: config.identity.role,
+      avatarUrl: config.identity.avatarUrl,
+      timezone: config.identity.timezone,
+      locale: config.identity.locale,
+      workingHours: config.identity.workingHours,
+    } : undefined,
+    emailOverrides: config.email ? {
+      pollIntervalMs: config.email.pollIntervalMs,
+      extraInvitePatterns: config.email.extraInvitePatterns,
     } : undefined,
     recurringTasks: config.recurringTasks?.map((t) => ({
       id: t.id,
@@ -80,14 +84,14 @@ export async function startAutonomousAgent(params: {
     browserNavigate,
   });
 
-  log("info", "Starting Autonomous Agent subsystem", {
-    identity: config.identity.displayName,
-    email: config.identity.email,
+  // Listen for bootstrap progress
+  orchestrator.googleBootstrap.onEvent((event) => {
+    log("info", `Google bootstrap: ${event.type}`, event as unknown as Record<string, unknown>);
   });
 
   await orchestrator.start();
 
-  log("info", "Autonomous Agent started", {
+  log("info", "Autonomous Agent is ready", {
     health: orchestrator.getHealth(),
   });
 

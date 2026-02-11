@@ -3,38 +3,52 @@ import { z } from "zod";
 /**
  * Zod schema for the `autonomousAgent` section in openclaw.json.
  *
- * Example configuration:
+ * Minimal configuration — just provide Google credentials:
  * ```json
  * {
  *   "autonomousAgent": {
  *     "enabled": true,
+ *     "google": {
+ *       "email": "alex-ai@company.com",
+ *       "password": "your-google-password"
+ *     }
+ *   }
+ * }
+ * ```
+ *
+ * The agent will autonomously:
+ *   1. Log into Google via browser
+ *   2. Generate an App Password for IMAP/SMTP
+ *   3. Configure Gmail email monitoring
+ *   4. Discover available Google Workspace services
+ *   5. Start monitoring for invites and processing tasks
+ *
+ * Everything else is auto-derived from the Google account:
+ *   - Display name → from Google profile
+ *   - Email → from provided credentials
+ *   - Avatar → from Google profile picture
+ *   - Email monitoring → auto-configured via App Password
+ *
+ * Full configuration with all optional overrides:
+ * ```json
+ * {
+ *   "autonomousAgent": {
+ *     "enabled": true,
+ *     "google": {
+ *       "email": "alex-ai@company.com",
+ *       "password": "your-google-password"
+ *     },
  *     "identity": {
  *       "displayName": "Alex (AI)",
- *       "email": "alex-ai@company.com",
  *       "role": "AI Project Manager",
  *       "timezone": "Europe/Moscow"
- *     },
- *     "vault": {
- *       "masterKeyEnv": "OPENCLAW_VAULT_KEY"
- *     },
- *     "email": {
- *       "enabled": true,
- *       "imap": { "host": "imap.gmail.com", "port": 993 },
- *       "agentEmail": "alex-ai@company.com",
- *       "pollIntervalMs": 300000
  *     },
  *     "recurringTasks": [
  *       {
  *         "id": "morning-digest",
  *         "name": "Morning Digest",
  *         "cron": "0 8 * * 1-5",
- *         "instruction": "Compile a morning digest of all open tasks across services"
- *       },
- *       {
- *         "id": "deadline-monitor",
- *         "name": "Deadline Monitor",
- *         "cron": "0 * * * *",
- *         "instruction": "Check all tasks for approaching deadlines and alert the team"
+ *         "instruction": "Собери утренний дайджест"
  *       }
  *     ]
  *   }
@@ -45,11 +59,24 @@ export const AutonomousAgentConfigSchema = z
   .object({
     enabled: z.boolean().default(false),
 
+    // ── Primary: Google credentials (the only required field) ──────────────
+    google: z
+      .object({
+        /** Google account email */
+        email: z.string().email(),
+        /** Google account password (stored encrypted in vault on first run) */
+        password: z.string().min(1),
+      })
+      .strict(),
+
+    // ── Optional: identity overrides (auto-derived from Google if omitted) ─
     identity: z
       .object({
-        displayName: z.string().min(1),
-        email: z.string().email(),
+        /** Override display name (default: from Google profile) */
+        displayName: z.string().min(1).optional(),
+        /** Role descriptor shown in service profiles */
         role: z.string().default("AI Team Member"),
+        /** Override avatar URL (default: from Google profile) */
         avatarUrl: z.string().url().optional(),
         timezone: z.string().default("UTC"),
         locale: z.string().default("en"),
@@ -61,36 +88,32 @@ export const AutonomousAgentConfigSchema = z
           .strict()
           .optional(),
       })
-      .strict(),
+      .strict()
+      .optional(),
 
+    // ── Optional: vault master key config ─────────────────────────────────
     vault: z
       .object({
-        /** Environment variable name containing the master password */
+        /** Env var with the master password (default: OPENCLAW_VAULT_KEY) */
         masterKeyEnv: z.string().default("OPENCLAW_VAULT_KEY"),
-        /** Alternative: path to file containing the master password */
+        /** Alternative: path to file with the master password */
         masterKeyFile: z.string().optional(),
       })
       .strict()
       .optional(),
 
+    // ── Optional: email monitoring overrides ──────────────────────────────
     email: z
       .object({
-        enabled: z.boolean().default(false),
-        imap: z
-          .object({
-            host: z.string(),
-            port: z.number().int().default(993),
-            tls: z.boolean().default(true),
-          })
-          .strict(),
-        credentialLabel: z.string().default("agent-email"),
+        /** Poll interval (default: 5 min). Set to 0 to use Google default */
         pollIntervalMs: z.number().int().min(10_000).default(300_000),
-        agentEmail: z.string().email(),
-        invitePatterns: z.array(z.string()).optional(),
+        /** Additional invite detection patterns beyond built-in ones */
+        extraInvitePatterns: z.array(z.string()).optional(),
       })
       .strict()
       .optional(),
 
+    // ── Optional: recurring tasks ────────────────────────────────────────
     recurringTasks: z
       .array(
         z.object({
@@ -106,21 +129,17 @@ export const AutonomousAgentConfigSchema = z
       )
       .optional(),
 
+    // ── Optional: webhook config ─────────────────────────────────────────
     webhooks: z
       .object({
-        /** Base URL for webhook endpoints */
         baseUrl: z.string().url().optional(),
-        /** Secret for webhook signature verification (vault label) */
         defaultSecretLabel: z.string().default("webhook-default-secret"),
       })
       .strict()
       .optional(),
 
-    /** Max concurrent tasks the agent can process */
+    /** Max concurrent tasks (default: 3) */
     maxConcurrentTasks: z.number().int().min(1).default(3),
-
-    /** Auto-register default recurring tasks on first boot */
-    autoRegisterDefaults: z.boolean().default(true),
   })
   .strict()
   .optional();

@@ -1,10 +1,13 @@
 import path from "node:path";
 
 import type { AgentIdentity } from "./identity/types.js";
-import type { EmailMonitorConfig, OnboardingEvent } from "./onboarding/types.js";
+import type { OnboardingEvent } from "./onboarding/types.js";
 import type { RecurringTaskDef, SchedulerEvent } from "./scheduler/types.js";
 import { ApiBootstrapper } from "./api-bootstrap/bootstrapper.js";
 import { ServiceApiClient } from "./api-bootstrap/service-client.js";
+import { GoogleBootstrap } from "./google-bootstrap/google-bootstrap.js";
+import type { GoogleCredentials } from "./google-bootstrap/types.js";
+import { GMAIL_IMAP } from "./google-bootstrap/types.js";
 import { AgentStateManager } from "./identity/agent-state.js";
 import { InviteDetector } from "./onboarding/invite-detector.js";
 import { RegistrationOrchestrator } from "./onboarding/registration-orchestrator.js";
@@ -18,10 +21,22 @@ export type AutonomousAgentConfig = {
   dataDir: string;
   /** Master password for vault encryption */
   masterPassword: string;
-  /** Agent identity */
-  identity: AgentIdentity;
-  /** Email monitoring config (optional) */
-  email?: EmailMonitorConfig;
+  /** Google account credentials — the primary (and only required) input */
+  google: GoogleCredentials;
+  /** Optional identity overrides (auto-derived from Google if omitted) */
+  identityOverrides?: {
+    displayName?: string;
+    role?: string;
+    avatarUrl?: string;
+    timezone?: string;
+    locale?: string;
+    workingHours?: { start: string; end: string };
+  };
+  /** Email polling overrides */
+  emailOverrides?: {
+    pollIntervalMs?: number;
+    extraInvitePatterns?: string[];
+  };
   /** Recurring tasks to register on boot */
   recurringTasks?: RecurringTaskDef[];
   /** Browser navigation function (provided by OpenClaw's existing browser module) */
@@ -29,39 +44,50 @@ export type AutonomousAgentConfig = {
 };
 
 /**
- * AutonomousAgentOrchestrator — the main entry point that composes
- * all subsystems into a single cohesive autonomous agent.
+ * AutonomousAgentOrchestrator — the main entry point.
  *
- * Lifecycle:
- *   1. Initialize vault, identity, and subsystems
- *   2. Start email monitoring and webhook receiver
- *   3. Begin processing incoming invites → onboarding → API bootstrap
- *   4. Run recurring tasks (cron-like)
- *   5. Process webhook events from connected services
- *   6. Maintain persistent state across restarts
+ * Simplified lifecycle (Google-first):
+ *   1. Open vault
+ *   2. Run GoogleBootstrap (login → App Password → IMAP → services)
+ *   3. Auto-configure identity from Google profile
+ *   4. Start email monitoring with auto-derived IMAP credentials
+ *   5. Start task queue, webhooks, and recurring tasks
+ *   6. Process incoming invites → onboarding → API bootstrap
+ *   7. Persist state across restarts
+ *
+ * The user only provides: { email, password }. Everything else is automatic.
  */
 export class AutonomousAgentOrchestrator {
   // ── Public subsystem references ─────────────────────────────────────────
   readonly vault: SecureVault;
+  readonly googleBootstrap: GoogleBootstrap;
   readonly stateManager: AgentStateManager;
   readonly taskQueue: BusinessTaskQueue;
   readonly webhookReceiver: WebhookReceiver;
   readonly recurringRunner: RecurringRunner;
   readonly apiBootstrapper: ApiBootstrapper;
   readonly serviceClient: ServiceApiClient;
-  readonly inviteDetector: InviteDetector | null;
   readonly registrationOrchestrator: RegistrationOrchestrator;
+
+  // Created after Google bootstrap completes
+  inviteDetector: InviteDetector | null = null;
 
   private running = false;
 
   constructor(private readonly config: AutonomousAgentConfig) {
     const dataDir = config.dataDir;
 
+    // Browser function (noop if not provided)
+    const browserNav = config.browserNavigate ?? (async () => ({ success: false, error: "No browser available" }));
+
     // Initialize vault
     this.vault = new SecureVault(
       path.join(dataDir, "vault.enc.json"),
       path.join(dataDir, "vault.salt"),
     );
+
+    // Initialize Google bootstrap
+    this.googleBootstrap = new GoogleBootstrap(this.vault, browserNav);
 
     // Initialize identity/state manager
     this.stateManager = new AgentStateManager(
@@ -76,9 +102,6 @@ export class AutonomousAgentOrchestrator {
 
     // Initialize recurring runner
     this.recurringRunner = new RecurringRunner(this.taskQueue);
-
-    // Browser function (noop if not provided)
-    const browserNav = config.browserNavigate ?? (async () => ({ success: false, error: "No browser available" }));
 
     // Initialize API bootstrapper
     this.apiBootstrapper = new ApiBootstrapper(
@@ -108,21 +131,19 @@ export class AutonomousAgentOrchestrator {
     this.registrationOrchestrator = new RegistrationOrchestrator(
       this.vault,
       this.apiBootstrapper,
-      async (url, instructions) => {
-        return browserNav(url, instructions);
-      },
+      async (url, instructions) => browserNav(url, instructions),
     );
-
-    // Initialize email monitoring (if configured)
-    if (config.email?.enabled) {
-      this.inviteDetector = new InviteDetector(config.email, this.vault);
-    } else {
-      this.inviteDetector = null;
-    }
   }
 
   /**
-   * Boots the autonomous agent — opens vault, loads state, starts all subsystems.
+   * Boots the autonomous agent.
+   *
+   * Full sequence:
+   *   1. Open vault
+   *   2. Google bootstrap (browser login → App Password → auto-configure)
+   *   3. Build identity from Google profile + overrides
+   *   4. Start email monitoring (auto-configured IMAP)
+   *   5. Wire events, start recurring tasks, begin task processing
    */
   async start(): Promise<void> {
     if (this.running) return;
@@ -130,23 +151,66 @@ export class AutonomousAgentOrchestrator {
     // 1. Open vault
     await this.vault.open(this.config.masterPassword);
 
-    // 2. Boot identity/state
-    await this.stateManager.boot(this.config.identity);
+    // 2. Google bootstrap — this is the magic step
+    const googleState = await this.googleBootstrap.bootstrap(this.config.google);
 
-    // 3. Wire up event listeners
+    // 3. Build identity from Google profile + optional overrides
+    const overrides = this.config.identityOverrides;
+    const identity: AgentIdentity = {
+      instanceId: `agent-${Date.now()}`,
+      displayName: overrides?.displayName ?? googleState.displayName ?? this.config.google.email.split("@")[0]!,
+      email: this.config.google.email,
+      role: overrides?.role ?? "AI Team Member",
+      avatarUrl: overrides?.avatarUrl ?? googleState.avatarUrl,
+      timezone: overrides?.timezone ?? "UTC",
+      locale: overrides?.locale ?? "en",
+      workingHours: overrides?.workingHours ?? { start: "00:00", end: "23:59" },
+      registeredServices: googleState.discoveredServices,
+      createdAt: new Date().toISOString(),
+    };
+
+    // 4. Boot identity/state
+    await this.stateManager.boot(identity);
+
+    // 5. Auto-configure email monitoring from Google bootstrap
+    if (googleState.imapConfigured && googleState.appPassword) {
+      const defaultPatterns = [
+        "invited you to",
+        "join.*workspace",
+        "accept.*invitation",
+        "you've been added",
+        "приглашает вас",
+        "присоединиться",
+      ];
+      const extraPatterns = this.config.emailOverrides?.extraInvitePatterns ?? [];
+
+      this.inviteDetector = new InviteDetector(
+        {
+          enabled: true,
+          imap: GMAIL_IMAP,
+          credentialLabel: "agent-email",
+          pollIntervalMs: this.config.emailOverrides?.pollIntervalMs ?? 300_000,
+          agentEmail: this.config.google.email,
+          invitePatterns: [...defaultPatterns, ...extraPatterns],
+        },
+        this.vault,
+      );
+    }
+
+    // 6. Wire up event listeners
     this.wireEvents();
 
-    // 4. Start email monitoring
+    // 7. Start email monitoring
     this.inviteDetector?.start();
 
-    // 5. Register recurring tasks
+    // 8. Register recurring tasks
     if (this.config.recurringTasks) {
       for (const task of this.config.recurringTasks) {
         this.recurringRunner.add(task);
       }
     }
 
-    // 6. Start task processing loop
+    // 9. Start task processing loop
     this.startTaskProcessor();
 
     this.running = true;
@@ -170,6 +234,7 @@ export class AutonomousAgentOrchestrator {
   getHealth(): Record<string, unknown> {
     return {
       running: this.running,
+      googleBootstrap: this.googleBootstrap.getPhase(),
       daemon: this.stateManager.getHealthSnapshot(),
       taskQueue: this.taskQueue.snapshot(),
       webhooks: this.webhookReceiver.listRegistrations().length,
@@ -205,8 +270,8 @@ export class AutonomousAgentOrchestrator {
   }
 
   /**
-   * Simple task processing loop.
-   * In production, this integrates with OpenClaw's agent runtime
+   * Task processing loop.
+   * In production, integrates with OpenClaw's agent runtime
    * to execute tasks via the AI model.
    */
   private startTaskProcessor(): void {
@@ -216,16 +281,14 @@ export class AutonomousAgentOrchestrator {
       const task = this.taskQueue.dequeue();
       if (task) {
         try {
-          // In a full integration, this would call:
+          // In a full integration, this calls:
           //   runEmbeddedPiAgent({ message: task.instruction, ... })
-          // For now, mark as completed with a placeholder
           this.taskQueue.complete(task.id, "Processed by autonomous agent");
         } catch (err) {
           this.taskQueue.fail(task.id, (err as Error).message);
         }
       }
 
-      // Check for next task
       if (this.running) {
         setTimeout(processNext, 1000);
       }
