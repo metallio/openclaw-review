@@ -1,14 +1,13 @@
+import { ImapFlow } from "imapflow";
 import { randomUUID } from "node:crypto";
-
-import type { EmailMonitorConfig, InviteRecord, OnboardingEvent } from "./types.js";
 import type { SecureVault } from "../vault/vault.js";
+import type { EmailMonitorConfig, InviteRecord, OnboardingEvent } from "./types.js";
 
 /**
  * InviteDetector — monitors a mailbox for service invitations.
  *
- * In production this would use an IMAP client (e.g., imapflow).
- * The core logic here handles pattern matching, deduplication,
- * and invite lifecycle management.
+ * Uses ImapFlow to connect to the agent's IMAP mailbox,
+ * fetches unseen messages, and detects invite patterns.
  */
 export class InviteDetector {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -25,7 +24,9 @@ export class InviteDetector {
    * Starts polling the agent's email for invitations.
    */
   start(): void {
-    if (!this.config.enabled) return;
+    if (!this.config.enabled) {
+      return;
+    }
 
     this.pollTimer = setInterval(() => {
       void this.poll();
@@ -46,7 +47,9 @@ export class InviteDetector {
     this.listeners.push(listener);
     return () => {
       const idx = this.listeners.indexOf(listener);
-      if (idx >= 0) this.listeners.splice(idx, 1);
+      if (idx >= 0) {
+        this.listeners.splice(idx, 1);
+      }
     };
   }
 
@@ -93,11 +96,9 @@ export class InviteDetector {
   }
 
   /**
-   * Fetches unread messages from the agent's mailbox.
-   * In production, use imapflow or similar IMAP library.
+   * Fetches unread messages from the agent's mailbox via IMAP.
    */
   private async fetchUnreadMessages(): Promise<EmailMessage[]> {
-    // Retrieve IMAP credentials from vault
     const password = this.vault.get({
       service: "agent-email",
       kind: "generic",
@@ -109,12 +110,131 @@ export class InviteDetector {
       return [];
     }
 
-    // IMAP fetch stub — replace with real imapflow integration
-    // In a real implementation:
-    //   const client = new ImapFlow({ host, port, auth: { user, pass }, secure: tls });
-    //   await client.connect();
-    //   for await (const msg of client.fetch("INBOX", { unseen: true })) { ... }
-    return [];
+    const client = new ImapFlow({
+      host: this.config.imap.host,
+      port: this.config.imap.port,
+      secure: this.config.imap.tls,
+      auth: { user: this.config.agentEmail, pass: password },
+      logger: false,
+    });
+
+    const messages: EmailMessage[] = [];
+
+    try {
+      await client.connect();
+      const lock = await client.getMailboxLock("INBOX");
+
+      try {
+        // Only look at unseen messages from the last 7 days
+        const since = new Date();
+        since.setDate(since.getDate() - 7);
+
+        const seqNos = await client.search({ seen: false, since });
+        if (!seqNos.length) {
+          return [];
+        }
+
+        // Limit to 50 most recent to avoid memory pressure
+        const toFetch = seqNos.slice(-50);
+
+        for await (const msg of client.fetch(toFetch, {
+          uid: true,
+          envelope: true,
+          bodyStructure: true,
+        })) {
+          try {
+            const body = await this.downloadTextParts(client, msg.uid, msg.bodyStructure);
+            messages.push({
+              id: msg.uid.toString(),
+              subject: msg.envelope.subject ?? "",
+              senderEmail: msg.envelope.from?.[0]?.address ?? "",
+              bodyText: body.text,
+              bodyHtml: body.html,
+              receivedAt: msg.envelope.date ?? new Date(),
+            });
+          } catch {
+            // Skip individual messages that fail to download/parse
+          }
+        }
+      } finally {
+        lock.release();
+      }
+    } finally {
+      await client.logout().catch(() => {});
+    }
+
+    return messages;
+  }
+
+  /**
+   * Downloads text/plain and text/html body parts from a message.
+   */
+  private async downloadTextParts(
+    client: ImapFlow,
+    uid: number,
+    structure: unknown,
+  ): Promise<{ text: string; html?: string }> {
+    const textPartId = this.findMimePart(structure, "text/plain");
+    const htmlPartId = this.findMimePart(structure, "text/html");
+
+    let text = "";
+    let html: string | undefined;
+
+    if (textPartId) {
+      text = await this.downloadPart(client, uid, textPartId);
+    }
+    if (htmlPartId) {
+      html = await this.downloadPart(client, uid, htmlPartId);
+      if (!text) {
+        text = html
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+    }
+
+    return { text, html };
+  }
+
+  /**
+   * Downloads and decodes a single MIME part by UID.
+   */
+  private async downloadPart(client: ImapFlow, uid: number, partId: string): Promise<string> {
+    const { content } = await client.download(String(uid), partId, { uid: true });
+    const chunks: Buffer[] = [];
+    for await (const chunk of content) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks).toString("utf-8");
+  }
+
+  /**
+   * Walks the MIME body structure tree to find a part by type.
+   */
+  private findMimePart(structure: unknown, mimeType: string): string | null {
+    if (!structure || typeof structure !== "object") {
+      return null;
+    }
+
+    const s = structure as Record<string, unknown>;
+    const type = typeof s.type === "string" ? s.type.toLowerCase() : "";
+    const subtype = typeof s.subtype === "string" ? s.subtype.toLowerCase() : "";
+    const fullType = subtype ? `${type}/${subtype}` : type;
+
+    if (fullType === mimeType) {
+      return typeof s.part === "string" ? s.part : "1";
+    }
+
+    if (Array.isArray(s.childNodes)) {
+      for (const child of s.childNodes) {
+        const found = this.findMimePart(child, mimeType);
+        if (found) {
+          return found;
+        }
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -125,11 +245,14 @@ export class InviteDetector {
     const searchText = `${msg.subject} ${msg.bodyText}`;
 
     const isInvite = patterns.some((p) => p.test(searchText));
-    if (!isInvite) return null;
+    if (!isInvite) {
+      return null;
+    }
 
     // Extract invite URL from the message
-    const urlMatch = msg.bodyHtml?.match(/href="(https?:\/\/[^"]+(?:invite|join|accept)[^"]*)"/i)
-      ?? msg.bodyText?.match(/(https?:\/\/\S+(?:invite|join|accept)\S*)/i);
+    const urlMatch =
+      msg.bodyHtml?.match(/href="(https?:\/\/[^"]+(?:invite|join|accept)[^"]*)"/i) ??
+      msg.bodyText?.match(/(https?:\/\/\S+(?:invite|join|accept)\S*)/i);
 
     const inviteUrl = urlMatch?.[1];
     const service = this.detectService(inviteUrl ?? "", msg.senderEmail);
@@ -164,7 +287,9 @@ export class InviteDetector {
 
     const combined = `${url} ${senderEmail}`;
     for (const [service, pattern] of servicePatterns) {
-      if (pattern.test(combined)) return service;
+      if (pattern.test(combined)) {
+        return service;
+      }
     }
     return "unknown";
   }

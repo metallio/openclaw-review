@@ -1,12 +1,11 @@
 import path from "node:path";
-
+import type { GoogleCredentials } from "./google-bootstrap/types.js";
 import type { AgentIdentity } from "./identity/types.js";
 import type { OnboardingEvent } from "./onboarding/types.js";
 import type { RecurringTaskDef, SchedulerEvent } from "./scheduler/types.js";
 import { ApiBootstrapper } from "./api-bootstrap/bootstrapper.js";
 import { ServiceApiClient } from "./api-bootstrap/service-client.js";
 import { GoogleBootstrap } from "./google-bootstrap/google-bootstrap.js";
-import type { GoogleCredentials } from "./google-bootstrap/types.js";
 import { GMAIL_IMAP } from "./google-bootstrap/types.js";
 import { AgentStateManager } from "./identity/agent-state.js";
 import { InviteDetector } from "./onboarding/invite-detector.js";
@@ -15,6 +14,19 @@ import { RecurringRunner } from "./scheduler/recurring-runner.js";
 import { BusinessTaskQueue } from "./scheduler/task-queue.js";
 import { WebhookReceiver } from "./scheduler/webhook-receiver.js";
 import { SecureVault } from "./vault/vault.js";
+
+/**
+ * Callback that executes a business task via the AI runtime.
+ *
+ * The gateway integration layer wraps `runEmbeddedPiAgent` behind this
+ * interface so the orchestrator stays decoupled from the agent runtime.
+ */
+export type TaskExecutor = (task: {
+  instruction: string;
+  name: string;
+  service?: string;
+  context?: Record<string, unknown>;
+}) => Promise<{ success: boolean; result?: string; error?: string }>;
 
 export type AutonomousAgentConfig = {
   /** Base directory for agent data (vault, state, etc.) */
@@ -40,7 +52,12 @@ export type AutonomousAgentConfig = {
   /** Recurring tasks to register on boot */
   recurringTasks?: RecurringTaskDef[];
   /** Browser navigation function (provided by OpenClaw's existing browser module) */
-  browserNavigate?: (url: string, instructions: string) => Promise<{ success: boolean; error?: string; extractedData?: Record<string, string> }>;
+  browserNavigate?: (
+    url: string,
+    instructions: string,
+  ) => Promise<{ success: boolean; error?: string; extractedData?: Record<string, string> }>;
+  /** Task executor — provided by gateway to run tasks through the AI model */
+  taskExecutor?: TaskExecutor;
 };
 
 /**
@@ -78,7 +95,8 @@ export class AutonomousAgentOrchestrator {
     const dataDir = config.dataDir;
 
     // Browser function (noop if not provided)
-    const browserNav = config.browserNavigate ?? (async () => ({ success: false, error: "No browser available" }));
+    const browserNav =
+      config.browserNavigate ?? (async () => ({ success: false, error: "No browser available" }));
 
     // Initialize vault
     this.vault = new SecureVault(
@@ -90,9 +108,7 @@ export class AutonomousAgentOrchestrator {
     this.googleBootstrap = new GoogleBootstrap(this.vault, browserNav);
 
     // Initialize identity/state manager
-    this.stateManager = new AgentStateManager(
-      path.join(dataDir, "agent-state.json"),
-    );
+    this.stateManager = new AgentStateManager(path.join(dataDir, "agent-state.json"));
 
     // Initialize task queue
     this.taskQueue = new BusinessTaskQueue();
@@ -104,18 +120,15 @@ export class AutonomousAgentOrchestrator {
     this.recurringRunner = new RecurringRunner(this.taskQueue);
 
     // Initialize API bootstrapper
-    this.apiBootstrapper = new ApiBootstrapper(
-      this.vault,
-      async (url, instructions) => {
-        const result = await browserNav(url, instructions);
-        return {
-          success: result.success,
-          extractedToken: result.extractedData?.["token"],
-          apiBaseUrl: result.extractedData?.["apiBaseUrl"],
-          error: result.error,
-        };
-      },
-    );
+    this.apiBootstrapper = new ApiBootstrapper(this.vault, async (url, instructions) => {
+      const result = await browserNav(url, instructions);
+      return {
+        success: result.success,
+        extractedToken: result.extractedData?.["token"],
+        apiBaseUrl: result.extractedData?.["apiBaseUrl"],
+        error: result.error,
+      };
+    });
 
     // Initialize service API client
     this.serviceClient = new ServiceApiClient(
@@ -146,7 +159,9 @@ export class AutonomousAgentOrchestrator {
    *   5. Wire events, start recurring tasks, begin task processing
    */
   async start(): Promise<void> {
-    if (this.running) return;
+    if (this.running) {
+      return;
+    }
 
     // 1. Open vault
     await this.vault.open(this.config.masterPassword);
@@ -158,7 +173,10 @@ export class AutonomousAgentOrchestrator {
     const overrides = this.config.identityOverrides;
     const identity: AgentIdentity = {
       instanceId: `agent-${Date.now()}`,
-      displayName: overrides?.displayName ?? googleState.displayName ?? this.config.google.email.split("@")[0]!,
+      displayName:
+        overrides?.displayName ??
+        googleState.displayName ??
+        this.config.google.email.split("@")[0]!,
       email: this.config.google.email,
       role: overrides?.role ?? "AI Team Member",
       avatarUrl: overrides?.avatarUrl ?? googleState.avatarUrl,
@@ -220,7 +238,9 @@ export class AutonomousAgentOrchestrator {
    * Graceful shutdown — stops all subsystems and persists state.
    */
   async stop(): Promise<void> {
-    if (!this.running) return;
+    if (!this.running) {
+      return;
+    }
 
     this.running = false;
     this.inviteDetector?.stop();
@@ -259,10 +279,7 @@ export class AutonomousAgentOrchestrator {
     // When a task completes → update state
     this.taskQueue.onEvent((event: SchedulerEvent) => {
       if (event.type === "task-completed") {
-        void this.stateManager.recordTaskCompletion(
-          "system",
-          event.result ?? "Task completed",
-        );
+        void this.stateManager.recordTaskCompletion("system", event.result ?? "Task completed");
       } else if (event.type === "task-failed") {
         void this.stateManager.recordTaskFailure();
       }
@@ -270,20 +287,36 @@ export class AutonomousAgentOrchestrator {
   }
 
   /**
-   * Task processing loop.
-   * In production, integrates with OpenClaw's agent runtime
-   * to execute tasks via the AI model.
+   * Task processing loop — dequeues tasks and executes them via the
+   * configured TaskExecutor (backed by runEmbeddedPiAgent in production).
    */
   private startTaskProcessor(): void {
+    const executor = this.config.taskExecutor;
+
     const processNext = async () => {
-      if (!this.running) return;
+      if (!this.running) {
+        return;
+      }
 
       const task = this.taskQueue.dequeue();
       if (task) {
         try {
-          // In a full integration, this calls:
-          //   runEmbeddedPiAgent({ message: task.instruction, ... })
-          this.taskQueue.complete(task.id, "Processed by autonomous agent");
+          if (!executor) {
+            this.taskQueue.fail(task.id, "No task executor configured");
+          } else {
+            const outcome = await executor({
+              instruction: task.instruction,
+              name: task.name,
+              service: task.service,
+              context: task.context as Record<string, unknown> | undefined,
+            });
+
+            if (outcome.success) {
+              this.taskQueue.complete(task.id, outcome.result ?? "Task completed");
+            } else {
+              this.taskQueue.fail(task.id, outcome.error ?? "Task execution failed");
+            }
+          }
         } catch (err) {
           this.taskQueue.fail(task.id, (err as Error).message);
         }

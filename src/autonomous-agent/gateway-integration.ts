@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-
 import type { AutonomousAgentConfig as ConfigSchemaType } from "./config-schema.js";
+import type { TaskExecutor } from "./orchestrator.js";
 import { AutonomousAgentOrchestrator } from "./orchestrator.js";
 
 /**
@@ -22,11 +22,16 @@ import { AutonomousAgentOrchestrator } from "./orchestrator.js";
 export async function startAutonomousAgent(params: {
   config: NonNullable<ConfigSchemaType>;
   dataDir: string;
-  browserNavigate?: (url: string, instructions: string) => Promise<{
+  browserNavigate?: (
+    url: string,
+    instructions: string,
+  ) => Promise<{
     success: boolean;
     error?: string;
     extractedData?: Record<string, string>;
   }>;
+  /** Task executor backed by runEmbeddedPiAgent (provided by gateway startup) */
+  taskExecutor?: TaskExecutor;
   log: (level: string, message: string, data?: Record<string, unknown>) => void;
 }): Promise<{
   orchestrator: AutonomousAgentOrchestrator;
@@ -42,7 +47,7 @@ export async function startAutonomousAgent(params: {
   if (!masterPassword) {
     throw new Error(
       "Autonomous Agent requires a vault master password. " +
-      "Set OPENCLAW_VAULT_KEY env var or configure vault.masterKeyFile.",
+        "Set OPENCLAW_VAULT_KEY env var or configure vault.masterKeyFile.",
     );
   }
 
@@ -59,18 +64,22 @@ export async function startAutonomousAgent(params: {
       email: config.google.email,
       password: config.google.password,
     },
-    identityOverrides: config.identity ? {
-      displayName: config.identity.displayName,
-      role: config.identity.role,
-      avatarUrl: config.identity.avatarUrl,
-      timezone: config.identity.timezone,
-      locale: config.identity.locale,
-      workingHours: config.identity.workingHours,
-    } : undefined,
-    emailOverrides: config.email ? {
-      pollIntervalMs: config.email.pollIntervalMs,
-      extraInvitePatterns: config.email.extraInvitePatterns,
-    } : undefined,
+    identityOverrides: config.identity
+      ? {
+          displayName: config.identity.displayName,
+          role: config.identity.role,
+          avatarUrl: config.identity.avatarUrl,
+          timezone: config.identity.timezone,
+          locale: config.identity.locale,
+          workingHours: config.identity.workingHours,
+        }
+      : undefined,
+    emailOverrides: config.email
+      ? {
+          pollIntervalMs: config.email.pollIntervalMs,
+          extraInvitePatterns: config.email.extraInvitePatterns,
+        }
+      : undefined,
     recurringTasks: config.recurringTasks?.map((t) => ({
       id: t.id,
       name: t.name,
@@ -82,6 +91,7 @@ export async function startAutonomousAgent(params: {
       skipIfRunning: t.skipIfRunning ?? true,
     })),
     browserNavigate,
+    taskExecutor: params.taskExecutor,
   });
 
   // Listen for bootstrap progress
@@ -127,12 +137,15 @@ export async function startAutonomousAgent(params: {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-async function resolveMasterPassword(
-  vault?: { masterKeyEnv?: string; masterKeyFile?: string },
-): Promise<string | undefined> {
+async function resolveMasterPassword(vault?: {
+  masterKeyEnv?: string;
+  masterKeyFile?: string;
+}): Promise<string | undefined> {
   const envVar = vault?.masterKeyEnv ?? "OPENCLAW_VAULT_KEY";
   const fromEnv = process.env[envVar];
-  if (fromEnv) return fromEnv;
+  if (fromEnv) {
+    return fromEnv;
+  }
 
   if (vault?.masterKeyFile) {
     try {
